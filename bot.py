@@ -7,11 +7,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery
 import asyncio
 import re
+from datetime import datetime
 
 from config import BOT_TOKEN, DEFAULT_SETTINGS, ALLOWED_USER_IDS
 from api_client import AxiomClient
 from storage import PositionStorage
 from middleware import WhitelistMiddleware  # Импортируем наш middleware
+from reports import ReportsManager  # ДОБАВЛЕННЫЙ ИМПОРТ
+from notifications import notification_manager  # ДОБАВЛЕННЫЙ ИМПОРТ
 
 # Настройка логирования
 logging.basicConfig(
@@ -35,6 +38,9 @@ logger.info(f"🔒 Whitelist активирован для пользовате�
 # Инициализация клиентов
 axiom_client = AxiomClient()
 
+# ДОБАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ СИСТЕМ ОТЧЕТНОСТИ
+reports_manager = ReportsManager()
+
 # Состояния для FSM
 class TradeStates(StatesGroup):
     awaiting_contract = State()
@@ -54,6 +60,8 @@ def main_keyboard():
     keyboard = [
         [types.InlineKeyboardButton(text="💰 Купить токен", callback_data='buy_token')],
         [types.InlineKeyboardButton(text="📊 Мои сделки", callback_data='my_trades')],
+        [types.InlineKeyboardButton(text="📈 Отчеты", callback_data='reports_menu')],  # НОВАЯ КНОПКА
+        [types.InlineKeyboardButton(text="🔔 Уведомления", callback_data='notifications_menu')],  # НОВАЯ КНОПКА
         [types.InlineKeyboardButton(text="⚙️ Настройки", callback_data='settings')],
         [types.InlineKeyboardButton(text="💼 Баланс", callback_data='balance')]
     ]
@@ -113,6 +121,38 @@ def position_details_keyboard(contract_address):
             callback_data=f'partial_sell_50_{contract_address}'
         )],
         [types.InlineKeyboardButton(text="🔙 К сделкам", callback_data='my_trades')]
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# НОВЫЕ КЛАВИАТУРЫ
+def reports_keyboard():
+    keyboard = [
+        [types.InlineKeyboardButton(text="📊 За неделю", callback_data='report_7')],
+        [types.InlineKeyboardButton(text="📈 За месяц", callback_data='report_30')],
+        [types.InlineKeyboardButton(text="📋 Все время", callback_data='report_all')],
+        [types.InlineKeyboardButton(text="📄 История сделок", callback_data='trade_history')],
+        [types.InlineKeyboardButton(text="🔙 Назад", callback_data='back_to_menu')]
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def notifications_keyboard():
+    keyboard = [
+        [types.InlineKeyboardButton(text="🔔 Настроить", callback_data='configure_notifications')],
+        [types.InlineKeyboardButton(text="📊 Текущие настройки", callback_data='show_notification_settings')],
+        [types.InlineKeyboardButton(text="🔙 Назад", callback_data='back_to_menu')]
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def notification_settings_keyboard():
+    keyboard = [
+        [types.InlineKeyboardButton(text="🟢 Открытие позиций", callback_data='toggle_position_open')],
+        [types.InlineKeyboardButton(text="🔴 Закрытие позиций", callback_data='toggle_position_close')],
+        [types.InlineKeyboardButton(text="🛑 Stop Loss", callback_data='toggle_stop_loss')],
+        [types.InlineKeyboardButton(text="🎯 Take Profit", callback_data='toggle_take_profit')],
+        [types.InlineKeyboardButton(text="⚖️ Breakeven", callback_data='toggle_breakeven')],
+        [types.InlineKeyboardButton(text="📅 Ежедневная сводка", callback_data='toggle_daily_summary')],
+        [types.InlineKeyboardButton(text="⚠️ Ошибки", callback_data='toggle_errors')],
+        [types.InlineKeyboardButton(text="🔙 Назад", callback_data='notifications_menu')]
     ]
     return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -240,6 +280,8 @@ async def start(message: types.Message, state: FSMContext):
 • ⚖️ Автоматическое перемещение в безубыток
 • 📊 Управлять открытыми позициями
 • ⚙️ Настраивать параметры торговли
+• 📈 Просматривать отчеты и аналитику
+• 🔔 Получать уведомления о сделках
 
 🔥 Автоматические функции:
 • Stop Loss: автоматическая продажа при убытке
@@ -277,10 +319,163 @@ async def back_to_menu_handler(callback_query: CallbackQuery, state: FSMContext)
 • ⚖️ Автоматическое перемещение в безубыток
 • 📊 Управлять открытыми позициями
 • ⚙️ Настраивать параметры торговли
+• 📈 Просматривать отчеты и аналитику
+• 🔔 Получать уведомления о сделках
 
 Выберите действие из меню ниже:
 """
     await callback_query.message.edit_text(welcome_text, reply_markup=main_keyboard())
+
+# НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ОТЧЕТОВ
+
+@dp.callback_query(F.data == "reports_menu")
+async def reports_menu_handler(callback_query: CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        "📈 <b>Отчеты и аналитика</b>\n\n"
+        "Выберите период для анализа ваших торгов:\n\n"
+        "📊 Статистика включает:\n"
+        "• Общий P&L и винрейт\n"
+        "• Лучшие и худшие сделки\n"
+        "• Среднее время удержания\n"
+        "• Количество сделок и позиций",
+        reply_markup=reports_keyboard(),
+        parse_mode='HTML'
+    )
+
+@dp.callback_query(F.data.startswith("report_"))
+async def show_report_handler(callback_query: CallbackQuery):
+    await callback_query.answer()
+    
+    period_map = {
+        'report_7': 7,
+        'report_30': 30,
+        'report_all': None
+    }
+    
+    days = period_map.get(callback_query.data)
+    user_id = callback_query.from_user.id
+    
+    report_text = reports_manager.format_trade_summary(user_id, days)
+    
+    await callback_query.message.edit_text(
+        f"<pre>{report_text}</pre>",
+        reply_markup=reports_keyboard(),
+        parse_mode='HTML'
+    )
+
+@dp.callback_query(F.data == "trade_history")
+async def trade_history_handler(callback_query: CallbackQuery):
+    await callback_query.answer()
+    
+    try:
+        user_id = callback_query.from_user.id
+        recent_trades = reports_manager.get_user_trades(user_id, 7)[:15]
+        
+        if not recent_trades:
+            text = "📋 <b>История сделок</b>\n\n🔭 Сделок не найдено"
+        else:
+            text = "📋 <b>Последние сделки (7 дней)</b>\n\n"
+            
+            for trade in recent_trades:
+                action_icons = {
+                    'open': '🟢',
+                    'close': '🔴',
+                    'sl': '🛑',
+                    'tp': '🎯'
+                }
+                
+                icon = action_icons.get(trade['action'], '⚪')
+                contract = trade['contract_address']
+                date = datetime.fromtimestamp(trade['timestamp']).strftime('%d.%m %H:%M')
+                
+                pnl_text = ""
+                if trade['action'] in ['close', 'sl', 'tp']:
+                    pnl_text = f" ({trade['pnl_percent']:+.1f}%)"
+                
+                text += f"{icon} {contract[:6]}... - {date}{pnl_text}\n"
+        
+        # Добавляем временную метку
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        text += f"\n<i>Обновлено: {timestamp}</i>"
+        
+        await callback_query.message.edit_text(
+            text,
+            reply_markup=reports_keyboard(),
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в trade_history_handler: {e}")
+        await callback_query.message.edit_text(
+            "❌ Ошибка получения истории сделок.",
+            reply_markup=reports_keyboard()
+        )
+
+# НОВЫЕ ОБРАБОТЧИКИ ДЛЯ УВЕДОМЛЕНИЙ
+
+@dp.callback_query(F.data == "notifications_menu")
+async def notifications_menu_handler(callback_query: CallbackQuery):
+    await callback_query.answer()
+    
+    settings_text = notification_manager.format_notification_settings(callback_query.from_user.id)
+    
+    text = f"""
+🔔 <b>Система уведомлений</b>
+
+Получайте мгновенные уведомления о:
+• Открытии и закрытии позиций
+• Срабатывании Stop Loss и Take Profit
+• Перемещении в безубыток
+• Ошибках системы
+
+{settings_text}
+"""
+    
+    await callback_query.message.edit_text(
+        text,
+        reply_markup=notifications_keyboard(),
+        parse_mode='HTML'
+    )
+
+@dp.callback_query(F.data == "configure_notifications")
+async def configure_notifications_handler(callback_query: CallbackQuery):
+    await callback_query.answer()
+    
+    await callback_query.message.edit_text(
+        "🔔 <b>Настройка уведомлений</b>\n\n"
+        "Нажмите на кнопку, чтобы включить/выключить уведомления:\n"
+        "✅ = включено, ❌ = выключено",
+        reply_markup=notification_settings_keyboard(),
+        parse_mode='HTML'
+    )
+
+@dp.callback_query(F.data == "show_notification_settings")
+async def show_notification_settings_handler(callback_query: CallbackQuery):
+    await callback_query.answer()
+    
+    settings_text = notification_manager.format_notification_settings(callback_query.from_user.id)
+    
+    await callback_query.message.edit_text(
+        settings_text,
+        reply_markup=notifications_keyboard(),
+        parse_mode='HTML'
+    )
+
+@dp.callback_query(F.data.startswith("toggle_"))
+async def toggle_notification_handler(callback_query: CallbackQuery):
+    await callback_query.answer()
+    
+    user_id = callback_query.from_user.id
+    setting_key = callback_query.data.replace('toggle_', '')
+    
+    current_settings = notification_manager.get_user_settings(user_id)
+    current_settings[setting_key] = not current_settings.get(setting_key, True)
+    notification_manager.set_user_notifications(user_id, current_settings)
+    
+    # Показываем обновленные настройки
+    await configure_notifications_handler(callback_query)
+
+# СУЩЕСТВУЮЩИЕ ОБРАБОТЧИКИ (без изменений)
 
 @dp.callback_query(F.data == "balance")
 async def show_balance(callback_query: CallbackQuery):
