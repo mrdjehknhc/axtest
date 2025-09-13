@@ -2,6 +2,9 @@ from axiomtradeapi import AxiomTradeClient
 from typing import Dict, List
 from config import AXIOM_ACCESS_TOKEN, AXIOM_REFRESH_TOKEN, WALLET_ADDRESS, PRIVATE_KEY, DEFAULT_SETTINGS
 from storage import PositionStorage
+from reports import ReportsManager
+from notifications import notification_manager
+import asyncio
 import logging
 import time
 import requests
@@ -17,6 +20,7 @@ class AxiomClient:
         self.wallet_address = WALLET_ADDRESS
         self.private_key = PRIVATE_KEY
         self.storage = PositionStorage()
+        self.reports = ReportsManager()  # ДОБАВЛЕННАЯ СТРОКА
     
     def get_token_price(self, contract_address: str) -> float:
         """Получаем текущую цену токена через Jupiter API (синхронная версия)"""
@@ -99,10 +103,23 @@ class AxiomClient:
             # Сохраняем позицию в хранилище
             self.storage.add_position(user_id, position_info)
             
+            # ДОБАВЛЕННЫЕ СТРОКИ:
+            # Логируем в отчеты
+            self.reports.log_position_open(user_id, position_info)
+            
+            # Отправляем уведомление
+            asyncio.create_task(
+                notification_manager.notify_position_opened(user_id, position_info)
+            )
+            
             logger.info(f"Position opened successfully: {position_id}")
             return position_info
             
         except Exception as e:
+            # ДОБАВЛЕННОЕ УВЕДОМЛЕНИЕ ОБ ОШИБКЕ:
+            asyncio.create_task(
+                notification_manager.notify_error(user_id, str(e), "Открытие позиции")
+            )
             logger.error(f"Ошибка открытия позиции: {e}")
             raise
     
@@ -153,6 +170,37 @@ class AxiomClient:
             if not result.get('success', False):
                 raise Exception(f"Ошибка продажи: {result.get('error', 'Unknown error')}")
             
+            # ДОБАВЛЕННЫЕ СТРОКИ - получаем данные для уведомлений до удаления позиции
+            if result.get('success') or result.get('signature'):
+                # Получаем данные позиции для логирования
+                positions = self.storage.get_positions(user_id)
+                position = next((p for p in positions if p['contract_address'] == contract_address), None)
+                
+                if position:
+                    current_price = self.get_token_price(contract_address)
+                    pnl_percent = position.get('pnl', 0)
+                    
+                    # ДОБАВЛЕННЫЕ СТРОКИ:
+                    # Логируем закрытие
+                    self.reports.log_position_close(
+                        user_id=user_id,
+                        contract_address=contract_address,
+                        action='close',
+                        amount_sol=position.get('invested_sol', 0),
+                        token_amount=amount_to_sell,
+                        current_price=current_price,
+                        pnl_percent=pnl_percent,
+                        entry_price=position.get('entry_price')
+                    )
+                    
+                    # Отправляем уведомление
+                    pnl_sol = position.get('invested_sol', 0) * (pnl_percent / 100)
+                    asyncio.create_task(
+                        notification_manager.notify_position_closed(
+                            user_id, contract_address, pnl_percent, pnl_sol, "manual"
+                        )
+                    )
+            
             # Если продаем все токены (100%), удаляем позицию
             if percentage >= 100.0:
                 positions = self.storage.get_positions(user_id)
@@ -171,6 +219,10 @@ class AxiomClient:
             return result
             
         except Exception as e:
+            # ДОБАВЛЕННОЕ УВЕДОМЛЕНИЕ ОБ ОШИБКЕ:
+            asyncio.create_task(
+                notification_manager.notify_error(user_id, str(e), "Закрытие позиции")
+            )
             logger.error(f"Ошибка закрытия позиции: {e}")
             raise
     
@@ -180,10 +232,33 @@ class AxiomClient:
             contract_address = position['contract_address']
             logger.info(f"Executing Stop Loss for {contract_address}")
             
+            # Получаем данные для уведомления
+            pnl_percent = position.get('pnl', 0)
+            
             result = self.close_position(user_id, contract_address, 100.0)
             
             if result.get('success') or result.get('signature'):
                 logger.info(f"Stop Loss executed successfully for {contract_address}")
+                
+                # ДОБАВЛЕННЫЕ СТРОКИ:
+                # Логируем SL
+                current_price = self.get_token_price(contract_address)
+                self.reports.log_position_close(
+                    user_id=user_id,
+                    contract_address=contract_address,
+                    action='sl',
+                    amount_sol=position.get('invested_sol', 0),
+                    token_amount=position.get('token_amount', 0),
+                    current_price=current_price,
+                    pnl_percent=pnl_percent,
+                    entry_price=position.get('entry_price')
+                )
+                
+                # Отправляем уведомление
+                asyncio.create_task(
+                    notification_manager.notify_stop_loss(user_id, contract_address, pnl_percent)
+                )
+                
                 return True
             else:
                 logger.error(f"Stop Loss failed for {contract_address}: {result}")
@@ -191,6 +266,10 @@ class AxiomClient:
                 
         except Exception as e:
             logger.error(f"Ошибка выполнения Stop Loss: {e}")
+            # Уведомление об ошибке
+            asyncio.create_task(
+                notification_manager.notify_error(user_id, str(e), "Stop Loss")
+            )
             return False
     
     def execute_take_profit(self, user_id: int, position: Dict, tp_index: int) -> bool:
@@ -216,6 +295,30 @@ class AxiomClient:
             
             if result.get('success') or result.get('signature'):
                 logger.info(f"Take Profit {tp_level}x executed successfully for {contract_address}")
+                
+                # ДОБАВЛЕННЫЕ СТРОКИ:
+                # Логируем TP
+                current_price = self.get_token_price(contract_address)
+                pnl_percent = position.get('pnl', 0)
+                
+                self.reports.log_position_close(
+                    user_id=user_id,
+                    contract_address=contract_address,
+                    action='tp',
+                    amount_sol=position.get('invested_sol', 0) * (volume_percent / 100),
+                    token_amount=position.get('token_amount', 0) * (volume_percent / 100),
+                    current_price=current_price,
+                    pnl_percent=pnl_percent,
+                    entry_price=position.get('entry_price')
+                )
+                
+                # Отправляем уведомление
+                asyncio.create_task(
+                    notification_manager.notify_take_profit(
+                        user_id, contract_address, tp_level, volume_percent, pnl_percent
+                    )
+                )
+                
                 return True
             else:
                 logger.error(f"Take Profit {tp_level}x failed for {contract_address}: {result}")
@@ -223,6 +326,10 @@ class AxiomClient:
                 
         except Exception as e:
             logger.error(f"Ошибка выполнения Take Profit: {e}")
+            # Уведомление об ошибке
+            asyncio.create_task(
+                notification_manager.notify_error(user_id, str(e), "Take Profit")
+            )
             return False
     
     def move_to_breakeven(self, user_id: int, position: Dict) -> bool:
@@ -240,10 +347,22 @@ class AxiomClient:
             
             contract_address = position['contract_address']
             logger.info(f"Moved stop loss to breakeven for {contract_address}")
+            
+            # ДОБАВЛЕННЫЕ СТРОКИ:
+            # Отправляем уведомление
+            pnl_percent = position.get('pnl', 0)
+            asyncio.create_task(
+                notification_manager.notify_breakeven(user_id, contract_address, pnl_percent)
+            )
+            
             return True
             
         except Exception as e:
             logger.error(f"Ошибка перемещения в безубыток: {e}")
+            # Уведомление об ошибке
+            asyncio.create_task(
+                notification_manager.notify_error(user_id, str(e), "Breakeven")
+            )
             return False
     
     def get_token_balance(self, contract_address: str) -> float:
